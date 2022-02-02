@@ -1,7 +1,14 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"io/ioutil"
+	"sort"
+	"strings"
+)
 import "log"
+import "os"
+import "strconv"
 import "net/rpc"
 import "hash/fnv"
 
@@ -14,6 +21,12 @@ type KeyValue struct {
 	Value string
 }
 
+// for sorting by key.
+type ByKey []KeyValue
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 //
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -24,47 +37,115 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func performMap(filename string, WorkerID string, TaskIndex int, nReduceNum int, mapf func(string, string) []KeyValue) {
+	// Open and read the contents of the file
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("Failed to open map input file %s: %e", filename, err)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("Failed to read map input file %s: %e", filename, err)
+	}
+	kva := mapf(filename, string(content)) // Get intermediate results
+	
+	hashedKva := make(map[int][]KeyValue) 
+	for _, kv := range kva {
+		hashed := ihash(kv.Key) % nReduceNum
+		hashedKva[hashed] = append(hashedKva[hashed], kv)
+	}
+	// Write the intermediate results in temporary files
+	for i := 0; i < nReduceNum; i++ {
+		ofile, _ := os.Create(tmpMapOutFile(WorkerID, TaskIndex, i))
+		for _, kv := range hashedKva[i] {
+			fmt.Fprintf(ofile, "%v\t%v\n", kv.Key, kv.Value)
+		}
+		ofile.Close()
+	}
+}
+
+func performReduce(WorkerID string, TaskIndex int, nMapNum int, reducef func(string, []string) string) {
+	var lines []string
+	var kva []KeyValue
+	
+	for mi := 0; mi < nMapNum; mi++ {
+		inputFile := finalMapOutFile(mi, TaskIndex)
+		file, err := os.Open(inputFile)
+		if err != nil {
+			log.Fatalf("Failed to open map output file %s: %e", inputFile, err)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("Failed to read map output file %s: %e", inputFile, err)
+		}
+		lines = append(lines, strings.Split(string(content), "\n")...)
+	}
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		kva = append(kva, KeyValue{
+			Key: parts[0],
+			Value: parts[1],
+		})
+	}
+	sort.Sort(ByKey(kva))
+
+	ofile, _ := os.Create(tmpReduceOutFile(WorkerID, TaskIndex))
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+		i = j
+	}
+	ofile.Close()	
+}
 
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	id := strconv.Itoa(os.Getpid())
+	log.Printf("Worker %s started\n", id)
 
-	// Your worker implementation here.
+	for { // Enter loop, continue to apply for a new task until no tasks left.
+		args := GetTaskArgs{ WorkerID: id}
+		reply := GetTaskReply{}
+		call("Coordinator.HandleGetTask", &args, &reply)
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		if reply.NoAvaliableTask { 	// All tasks have been finished!
+			log.Printf("Received job finish signal from coordinator")
+			break
+		}
 
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		log.Printf("Received %s task %d from coordinator", reply.TaskType, reply.TaskIndex)
+		switch reply.TaskType {
+		case MAP:
+			performMap(reply.MapInputFile, id, reply.TaskIndex, reply.ReduceNum,mapf)
+		case REDUCE:
+			performReduce(id, reply.TaskIndex, reply.MapNum, reducef)	
+		default:
+			log.Fatalf("Unknown task type")
+		}
+		finargs := FinishedTaskArgs {
+			WorkerID: id,
+			TaskType: reply.TaskType,
+			TaskIndex: reply.TaskIndex,
+		}
+		finreply := FinishedTaskReply {}
+		log.Printf("Finished %s task %d", reply.TaskType, reply.TaskIndex)
+		call("Coordinator.HandleFinishedTask", &finargs, &finreply)
 	}
+	log.Printf("Worker %s exit\n", id)
 }
 
 //
